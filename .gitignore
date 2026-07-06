@@ -1,0 +1,59 @@
+# ---- Local llama.cpp checkout (if cloned inside this repo) ----
+/llama.cpp/
+llama.cpp-*/
+
+# ---- Build output ----
+build/
+build-*/
+cmake-build-*/
+out/
+bin/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+
+# ---- CMake ----
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Makefile
+compile_commands.json
+
+# ---- Model weights / GGUF files ----
+*.gguf
+*.bin
+*.safetensors
+models/
+
+# ---- Patch rejects / backups ----
+*.orig
+*.rej
+*.bak
+
+# ---- Logs and benchmark dumps ----
+*.log
+perf-*.txt
+
+# ---- Python (helper/benchmark scripts) ----
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# ---- Editor / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# ---- OS ----
+Thumbs.db
+desktop.ini
