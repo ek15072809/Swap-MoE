@@ -343,11 +343,11 @@ Issues and pull requests are welcome — in particular:
 If TaQuants is useful in your work, please consider citing it:
 
 ```bibtex
-@software{taquants2026,
+@software{swapmoe2026,
   author = {ek15072809},
-  title  = {TaQuants: Tensor-aware Adaptive Quantization for LLMs},
+  title  = {swap-moe: Tensor-aware Adaptive Quantization for LLMs},
   year   = {2026},
-  url    = {https://github.com/ek15072809/TaQuants}
+  url    = {https://github.com/ek15072809/swap-moe}
 }
 ```
 
