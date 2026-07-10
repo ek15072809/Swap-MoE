@@ -345,7 +345,7 @@ If TaQuants is useful in your work, please consider citing it:
 ```bibtex
 @software{swapmoe2026,
   author = {ek15072809},
-  title  = {swap-moe: Tensor-aware Adaptive Quantization for LLMs},
+  title  = {swap-moe: On-Demand SSD Loading for Inference of Massive MoE Models in Low-RAM Environments},
   year   = {2026},
   url    = {https://github.com/ek15072809/swap-moe}
 }
