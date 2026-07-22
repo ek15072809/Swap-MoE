@@ -4,10 +4,10 @@
 
 ### On-demand SSD loading for massive MoE models on low-RAM machines
 
-**Run 35B–230B parameter Mixture-of-Experts models on a 16GB RAM consumer PC — no GPU required.**
+**Run 200B+ parameter Mixture-of-Experts models on a 16GB RAM consumer PC — no GPU required.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![llama.cpp](https://img.shields.io/badge/llama.cpp-6cb18b2f-blue)](https://github.com/ggml-org/llama.cpp)
+[![llama.cpp](https://img.shields.io/badge/llama.cpp-1f66c3c-blue)](https://github.com/ggml-org/llama.cpp)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)]()
 
 [Overview](#overview) •
@@ -48,7 +48,7 @@ practical token rates:
 
 | Model | Quant | File size | Normal load | Swap-MoE |
 |---|---|---|---|---|
-| Qwen3.5-35B-A3B    | Q4_K_M | 19.7 GB | ❌ fails to launch | ✅ 7.01 tok/s |
+| Qwen3.5-35B-A3B    | Q4_K_M | 19.7 GB | ❌ fails to launch | ✅ 7.28 tok/s |
 | Qwen3.5-122B-A10B  | Q2_K   | 42.6 GB | ❌ fails to launch | ✅ 2.00 tok/s |
 | MiniMax-2.7        | IQ1_M  | 60.7 GB | ❌ fails to launch | ✅ 0.75 tok/s |
 
@@ -93,8 +93,8 @@ This is enabled with a single flag:
 ```
 
 Supported on any MoE architecture that uses the standard `ffn_*_exps` tensor
-naming, including **Qwen3-MoE**, **Qwen3.5-MoE**, **MiniMax-M2 / M2.7**, and
-**DeepSeek-V2 / V3**.
+naming, including **Qwen3-MoE**, **Qwen3.5-MoE**, **MiniMax-M2 / M2.7**,
+**DeepSeek-V2 / V3**, **Laguna-S-2.1** and so on.
 
 ### 2. LRU keep-recent — explicit RAM budget per layer
 
@@ -153,9 +153,12 @@ model, window length, and quantization — see [Benchmarks](#benchmarks) and
 
 ## Installation
 
-Swap-MoE is distributed as a single patch file, `llama_cpp-expert-streaming.patch`,
+Swap-MoE is distributed as a single patch file, `llama.cpp-expert-streaming.patch`,
 against a specific llama.cpp commit. It is **not** a standalone fork — you
 apply it to your own llama.cpp checkout.
+
+> **This release targets llama.cpp commit `1f66c3c` ("Add support for Laguna XS.2 & M.1", July 2026).
+> The previous release targeted `6cb18b2f`.**
 
 ### Requirements
 
@@ -174,14 +177,14 @@ apply it to your own llama.cpp checkout.
 # 1. Clone llama.cpp and check out the exact commit this patch targets
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 6cb18b2f
+git checkout 1f66c3c
 
 # 2. Apply the Swap-MoE patch
-git apply /path/to/llama_cpp-expert-streaming.patch
+git apply /path/to/llama.cpp-expert-streaming.patch
 
 # (if git apply complains about whitespace/context drift, try:)
-# git apply --3way /path/to/llama_cpp-expert-streaming.patch
-# patch -p1 < /path/to/llama_cpp-expert-streaming.patch
+# git apply --3way /path/to/llama.cpp-expert-streaming.patch
+# patch -p1 < /path/to/llama.cpp-expert-streaming.patch
 
 # 3. Configure and build (CPU-only build; see llama.cpp's own docs for
 #    GPU-backend flags — GPU offload is not currently combined with
@@ -193,10 +196,35 @@ cmake --build build --config Release -j"$(nproc)"
 # or build\bin\Release\llama-cli.exe (Windows)
 ```
 
-> **Note:** This patch must be applied to llama.cpp at commit `6cb18b2f`.
+> **Note:** This patch must be applied to llama.cpp at commit `1f66c3c`.
 > Applying it to a different commit may fail or silently produce incorrect
 > results, since it touches internal loader and graph-building code that
 > changes frequently upstream.
+>
+> **What changed vs the previous release (`6cb18b2f`):**
+> - `llm_graph_context::build_moe_ffn` now accepts an optional
+>   `selected_experts_in` parameter that, when non-null, bypasses the
+>   `ggml_argsort_top_k` call. The fixation graph node is therefore inserted
+>   *after* the (possibly pre-supplied) selected-experts tensor rather than
+>   unconditionally after `argsort_top_k`.
+> - `llama_model::impl` gained a `tensor_split_owned` member upstream; the
+>   expert-streaming and expert-fixation state is now placed *after* that new
+>   member so the struct layout stays consistent.
+> - All other hunks apply cleanly with a small line-offset shift.
+>
+> These are pure porting fixes — no behavioural change vs the `6cb18b2f`
+> release. Verified by building llama.cpp `1f66c3c` with the patch applied
+> (CPU-only Release build) and exercising the patched code paths with a
+> synthetic Qwen2-MoE GGUF:
+> - `--expert-streaming` triggers `expert streaming enabled — skipping initial
+>   mmap prefetch for routed expert tensors` and `expert_stream: tracking 24
+>   routed expert slices`.
+> - `--expert-keep-recent 2` triggers `expert keep-recent window = 2 experts
+>   per layer`.
+> - `--expert-fixation 4` triggers `expert fixation active — top-k pinned for
+>   the first 4 forward passes`, and the per-layer fixation graph nodes are
+>   inserted (graph node count rises from 106 → 108 for a 2-layer test model).
+> - `--expert-cache-size` is accepted by both `llama-cli` and `llama-server`.
 
 ## Usage
 
@@ -345,7 +373,7 @@ If TaQuants is useful in your work, please consider citing it:
 ```bibtex
 @software{swapmoe2026,
   author = {ek15072809},
-  title  = {swap-moe: On-Demand SSD Loading for Inference of Massive MoE Models in Low-RAM Environments},
+  title  = {Swap-MoE: On-Demand SSD Loading for Inference of Massive MoE Models in Low-RAM Environments},
   year   = {2026},
   url    = {https://github.com/ek15072809/swap-moe}
 }
