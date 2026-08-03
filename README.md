@@ -7,7 +7,7 @@
 **Run 200B+ parameter Mixture-of-Experts models on a 16GB RAM consumer PC — no GPU required.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![llama.cpp](https://img.shields.io/badge/llama.cpp-1f66c3c-blue)](https://github.com/ggml-org/llama.cpp)
+[![llama.cpp](https://img.shields.io/badge/llama.cpp-221f0f635-blue)](https://github.com/ggml-org/llama.cpp)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)]()
 
 [Overview](#overview) •
@@ -38,11 +38,11 @@ file is never touched for any given token.
 that removes this restriction. It keeps the weights of routed (non-shared)
 experts `mmap`'d directly on the SSD and lets the OS's own demand-paging
 mechanism pull only the experts that are actually selected by the router into
-RAM, on the fly, during inference. Two optional companion mechanisms —
-**LRU keep-recent** and **Expert Fixation** — give you further control over
-RAM usage and SSD I/O.
+RAM, on the fly, during inference. Three optional companion mechanisms —
+**LRU keep-recent**, **Expert Fixation**, and **Expert Prefetch** — give you
+further control over RAM usage and SSD I/O.
 
-With Swap-MoE, all three MoE models below — none of which could even *start*
+With Swap-MoE, all four MoE models below — none of which could even *start*
 under normal `llama.cpp` loading on a 16GB-RAM machine — become runnable at
 practical token rates:
 
@@ -51,6 +51,7 @@ practical token rates:
 | Qwen3.5-35B-A3B    | Q4_K_M | 19.7 GB | ❌ fails to launch | ✅ 7.28 tok/s |
 | Qwen3.5-122B-A10B  | Q2_K   | 42.6 GB | ❌ fails to launch | ✅ 2.00 tok/s |
 | MiniMax-2.7        | IQ1_M  | 60.7 GB | ❌ fails to launch | ✅ 0.75 tok/s |
+| DeepSeek-V4-Flash-0731 | IQ1_M | 80.9 GB | ❌ fails to launch | ✅ 0.55 tok/s |
 
 See [Benchmarks](#benchmarks) below and the [technical report](#technical-report)
 for the full methodology and additional configurations.
@@ -94,7 +95,10 @@ This is enabled with a single flag:
 
 Supported on any MoE architecture that uses the standard `ffn_*_exps` tensor
 naming, including **Qwen3-MoE**, **Qwen3.5-MoE**, **MiniMax-M2 / M2.7**,
-**DeepSeek-V2 / V3**, **Laguna-S-2.1** and so on.
+**DeepSeek-V2 / V3 / V4**, **Laguna-S-2.1** and so on. Note that DeepSeek-V4's
+hash-routed layers have some caveats around Expert Fixation and Expert
+Prefetch — see [Expert Prefetch](#4-expert-prefetch--hiding-ssd-latency-behind-compute)
+below.
 
 ### 2. LRU keep-recent — explicit RAM budget per layer
 
@@ -151,14 +155,63 @@ combined to offset fixation's accuracy cost by routing to more experts:
 model, window length, and quantization — see [Benchmarks](#benchmarks) and
 [Known Limitations](#known-limitations).
 
+### 4. Expert Prefetch — hiding SSD latency behind compute
+
+Even with Expert Streaming, the very first access to an expert on a given
+forward pass is a synchronous page fault: compute for that expert stalls
+until the SSD read completes. **Expert Prefetch** removes this stall by
+predicting, ahead of time, which experts the *next* forward pass will need,
+and warming the OS page cache for them in the background while the CPU is
+still busy with the current pass.
+
+A dedicated background thread tracks the per-layer expert IDs selected on
+the most recent (non-warmup) forward pass and uses them as the prediction
+for the next one — adjacent decode steps almost always route to mostly the
+same experts, so this prediction is accurate in practice. Once a new set of
+predicted expert IDs is available, the thread issues non-blocking OS hints
+(`madvise(WILLNEED)` on Linux, `PrefetchVirtualMemory` on Windows) for those
+experts' pages, letting the kernel schedule the SSD reads concurrently with
+ongoing CPU compute rather than on the critical path. By the time the next
+forward pass actually reaches those experts, their weights are often already
+resident, making the effective load time close to zero.
+
+This is enabled with a single flag:
+
+```
+--expert-prefetch
+```
+
+Only meaningful together with `--expert-streaming`. A few notes on its
+behavior:
+
+- The **first forward pass** after model load has no prior-pass prediction
+  to work from, so it is not prefetched — ordinary demand paging handles it,
+  same as without this flag.
+- **DeepSeek-V4's hash-routed layers** select their experts as a function of
+  the *input token*, not the hidden state, so their routing cannot be
+  predicted from the previous forward pass. Expert Prefetch (and Expert
+  Fixation) are automatically skipped for those specific layers; all other,
+  non-hash-routed layers in the same model still benefit normally.
+- Recommended especially for decode-heavy workloads on slower (e.g. SATA)
+  SSDs, where the synchronous page-fault stall is the dominant cost.
+
+```bash
+./build/bin/llama-cli \
+  -m /path/to/DeepSeek-V4-Flash-0731-IQ1_M.gguf \
+  --expert-streaming \
+  --expert-prefetch \
+  -p "Hello, world!" \
+  -n 128
+```
+
 ## Installation
 
 Swap-MoE is distributed as a single patch file, `llama.cpp-expert-streaming.patch`,
 against a specific llama.cpp commit. It is **not** a standalone fork — you
 apply it to your own llama.cpp checkout.
 
-> **This release targets llama.cpp commit `1f66c3c` ("Add support for Laguna XS.2 & M.1", July 2026).
-> The previous release targeted `6cb18b2f`.**
+> **This release targets llama.cpp commit `221f0f635`.
+> The previous release targeted `1f66c3c`.**
 
 ### Requirements
 
@@ -177,7 +230,7 @@ apply it to your own llama.cpp checkout.
 # 1. Clone llama.cpp and check out the exact commit this patch targets
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 1f66c3c
+git checkout 221f0f635
 
 # 2. Apply the Swap-MoE patch
 git apply /path/to/llama.cpp-expert-streaming.patch
@@ -196,24 +249,26 @@ cmake --build build --config Release -j"$(nproc)"
 # or build\bin\Release\llama-cli.exe (Windows)
 ```
 
-> **Note:** This patch must be applied to llama.cpp at commit `1f66c3c`.
+> **Note:** This patch must be applied to llama.cpp at commit `221f0f635`.
 > Applying it to a different commit may fail or silently produce incorrect
 > results, since it touches internal loader and graph-building code that
 > changes frequently upstream.
 >
-> **What changed vs the previous release (`6cb18b2f`):**
-> - `llm_graph_context::build_moe_ffn` now accepts an optional
->   `selected_experts_in` parameter that, when non-null, bypasses the
->   `ggml_argsort_top_k` call. The fixation graph node is therefore inserted
->   *after* the (possibly pre-supplied) selected-experts tensor rather than
->   unconditionally after `argsort_top_k`.
-> - `llama_model::impl` gained a `tensor_split_owned` member upstream; the
->   expert-streaming and expert-fixation state is now placed *after* that new
->   member so the struct layout stays consistent.
-> - All other hunks apply cleanly with a small line-offset shift.
+> **What changed vs the previous release (`1f66c3c`):**
+> - Added the new `--expert-prefetch` flag: a background thread that
+>   asynchronously prefetches the predicted next-pass routed experts into
+>   the OS page cache while CPU compute for the current pass is still
+>   running, hiding most of the SSD page-fault latency that Expert Streaming
+>   alone still incurs. See [Expert Prefetch](#4-expert-prefetch--hiding-ssd-latency-behind-compute).
+> - Added support for **DeepSeek-V4** (including its hash-routed layers).
+>   Since a hash-routed layer's expert selection depends on the input token
+>   rather than the hidden state, it cannot be predicted from the previous
+>   pass — Expert Fixation and Expert Prefetch are automatically disabled
+>   for those specific layers, while Expert Streaming and Expert Prefetch's
+>   non-hash-routed layers are unaffected.
+> - All other hunks carried over from the `1f66c3c` release apply cleanly.
 >
-> These are pure porting fixes — no behavioural change vs the `6cb18b2f`
-> release. Verified by building llama.cpp `1f66c3c` with the patch applied
+> Verified by building llama.cpp `221f0f635` with the patch applied
 > (CPU-only Release build) and exercising the patched code paths with a
 > synthetic Qwen2-MoE GGUF:
 > - `--expert-streaming` triggers `expert streaming enabled — skipping initial
@@ -224,6 +279,9 @@ cmake --build build --config Release -j"$(nproc)"
 > - `--expert-fixation 4` triggers `expert fixation active — top-k pinned for
 >   the first 4 forward passes`, and the per-layer fixation graph nodes are
 >   inserted (graph node count rises from 106 → 108 for a 2-layer test model).
+> - `--expert-prefetch` triggers `async prefetch thread started`, and
+>   subsequent forward passes log `expert_stream: async prefetch issued N
+>   page hints across M layers`.
 > - `--expert-cache-size` is accepted by both `llama-cli` and `llama-server`.
 
 ## Usage
@@ -237,10 +295,12 @@ All flags below are added on top of llama.cpp's normal CLI (`llama-cli`,
 | `--expert-cache-size` | `N_MiB` | `0` | Target RAM (MiB) for the routed-expert page cache. `0` lets the OS manage it. When set, a byte-budget eviction pass runs after every token. |
 | `--expert-keep-recent` | `N` | `0` | Keep the *N* most recently used experts per layer resident, explicitly evicting anything older after each forward pass. `0` disables this. Only meaningful with `--expert-streaming`. |
 | `--expert-fixation` | `N` | `0` | Pin the router's top-k selection to the first pass's result for the next *N* forward passes, eliminating repeated SSD reads for those tokens. `0` disables this. Only meaningful with `--expert-streaming`. |
+| `--expert-prefetch` | — | off | Asynchronously prefetch the predicted next-pass routed-expert pages from SSD into the OS page cache in parallel with CPU compute, so the following forward pass finds them already resident. Only meaningful with `--expert-streaming`. Automatically skipped on DeepSeek-V4's hash-routed layers, whose routing cannot be predicted from the previous pass. |
 
 Each flag also has a corresponding environment variable
 (`LLAMA_ARG_EXPERT_STREAMING`, `LLAMA_ARG_EXPERT_CACHE_SIZE`,
-`LLAMA_ARG_EXPERT_KEEP_RECENT`, `LLAMA_ARG_EXPERT_FIXATION`).
+`LLAMA_ARG_EXPERT_KEEP_RECENT`, `LLAMA_ARG_EXPERT_FIXATION`,
+`LLAMA_ARG_EXPERT_PREFETCH`).
 
 ### Example: minimal — just make a huge model launch
 
@@ -275,6 +335,17 @@ Each flag also has a corresponding environment variable
   -n 512
 ```
 
+### Example: hide SSD latency behind compute with prefetch
+
+```bash
+./build/bin/llama-cli \
+  -m /path/to/DeepSeek-V4-Flash-0731-IQ1_M.gguf \
+  --expert-streaming \
+  --expert-prefetch \
+  -p "Explain the theory of relativity." \
+  -n 256
+```
+
 ### Example: `llama-server`
 
 The same flags work with `llama-server`:
@@ -298,6 +369,12 @@ The same flags work with `llama-server`:
   model and window size before relying on it. Small active-parameter, higher-bit
   models tend to tolerate small fixation windows (e.g. `N=2`) reasonably well;
   large active-parameter or very low-bit quantized models degrade quickly.
+- Add `--expert-prefetch` alongside `--expert-streaming` whenever you can
+  spare a background thread; unlike `--expert-fixation` it carries no
+  accuracy cost, since it only warms the page cache ahead of time rather
+  than changing routing. It is especially worthwhile on models with
+  hash-routed layers (e.g. DeepSeek-V4), where fixation isn't fully
+  available.
 
 ## Benchmarks
 
@@ -305,11 +382,12 @@ Measured on a consumer PC: 13th-gen Intel Core i7, 16GB physical RAM, NVMe
 SSD, CPU-only inference (no GPU offload). Throughput is instantaneous
 tokens/s measured at decode token 400.
 
-| Model | Quant | Size (GB) | normal | expert-streaming | keep-recent 12 | fixation N=2 | fixation N=4 |
-|---|---|---|---|---|---|---|---|
-| Qwen3.5-35B-A3B   | Q4_K_M | 19.7 | ❌ fails to launch | 7.01 | 5.89 | **7.28** | 5.99 ⚠️ |
-| Qwen3.5-122B-A10B | Q2_K   | 42.6 | ❌ fails to launch | 2.00 | 1.00 | 0.35 ⚠️ | 0.53 ⚠️ |
-| MiniMax-2.7       | IQ1_M  | 60.7 | ❌ fails to launch | 0.75 | 0.44 | 0.53 ⚠️ | 0.40 ⚠️ |
+| Model | Quant | Size (GB) | normal | expert-streaming | expert-prefetch | keep-recent 12 | fixation N=2 | fixation N=4 |
+|---|---|---|---|---|---|---|---|---|
+| Qwen3.5-35B-A3B   | Q4_K_M | 19.7 | ❌ fails to launch | 7.01 | — | 5.89 | **7.28** | 5.99 ⚠️ |
+| Qwen3.5-122B-A10B | Q2_K   | 42.6 | ❌ fails to launch | 2.00 | — | 1.00 | 0.35 ⚠️ | 0.53 ⚠️ |
+| MiniMax-2.7       | IQ1_M  | 60.7 | ❌ fails to launch | 0.75 | — | 0.44 | 0.53 ⚠️ | 0.40 ⚠️ |
+| DeepSeek-V4-Flash-0731 | IQ1_M | 80.9 GB | ❌ fails to launch | 0.39 | **0.55** | 0.55 | -¹ | -¹ |
 
 ⚠️ = a numeric throughput value was measured, but generation quality was
 visually confirmed to have collapsed (repetitive/incoherent output) under
@@ -317,17 +395,31 @@ this condition — the speed number is **not** representative of usable
 output. See the [technical report](#technical-report) for the full
 discussion.
 
+— = not benchmarked for this model in this round.
+
+¹ = Expert Fixation is not supported for DeepSeek-V4-Flash-0731: the model's
+hash-routed layers select experts from the input token rather than the
+hidden state, so pinning the previous pass's top-k result to a fixed window
+doesn't apply to them the way it does on other architectures.
+
 **Key takeaways:**
 
-- Expert Streaming alone turns "does not launch" into 0.75–7.01 tok/s across
-  all three models, with no observed quality impact.
+- Expert Streaming alone turns "does not launch" into 0.39–7.01 tok/s across
+  all four models, with no observed quality impact.
+- `--expert-prefetch` gave a clean, accuracy-free speedup on
+  DeepSeek-V4-Flash-0731, raising throughput from 0.39 tok/s
+  (`--expert-streaming` alone) to **0.55 tok/s** on the 16GB-RAM test
+  machine, by overlapping the next pass's expert page-ins with the current
+  pass's compute.
 - `--expert-keep-recent` was slower than plain `expert-streaming` in every
-  test here — explicit eviction costs more than it saves compared to the
-  OS's own page-cache management, unless you specifically need a RAM cap.
+  test here except DeepSeek-V4-Flash-0731 — explicit eviction costs more
+  than it saves compared to the OS's own page-cache management, unless you
+  specifically need a RAM cap.
 - `--expert-fixation` only paid off cleanly on the smallest/highest-active-parameter
   model (Qwen3.5-35B-A3B at N=2). On larger or more aggressively quantized
   models, fixation reliably degraded output quality even though the
-  raw token rate looked fine.
+  raw token rate looked fine. It is not applicable at all to
+  DeepSeek-V4-Flash-0731's hash-routed layers.
 
 ## Known Limitations
 
@@ -345,6 +437,12 @@ discussion.
 - **Single-machine evaluation.** All numbers above come from one hardware
   configuration. Results will vary with different CPUs and, especially,
   different SSD read latency/throughput characteristics.
+- **DeepSeek-V4 hash-routed layers are not covered by Fixation or
+  Prefetch.** Since those layers select experts from the input token rather
+  than the hidden state, their routing can't be pinned to a prior window
+  (Fixation) or predicted from the previous pass (Prefetch). Expert
+  Streaming and Expert Prefetch still apply normally to the model's
+  non-hash-routed layers.
 - This patch is **experimental** and modifies internal loader and graph-build
   code paths in llama.cpp. Expect to need to re-port it when updating to a
   newer llama.cpp commit.

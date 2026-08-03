@@ -1,9 +1,9 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 48e274774..91b9bd2f8 100644
+index 79480e06f..83519f879 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -2483,6 +2483,34 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
-             params.use_mmap = value;
+@@ -2560,6 +2560,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
+             params.load_mode = value ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
          }
      ).set_env("LLAMA_ARG_MMAP"));
 +    add_opt(common_arg(
@@ -34,46 +34,66 @@ index 48e274774..91b9bd2f8 100644
 +            params.expert_fixation = std::stoi(value);
 +        }
 +    ).set_env("LLAMA_ARG_EXPERT_FIXATION"));
++    add_opt(common_arg(
++        {"--expert-prefetch"},
++        "asynchronously prefetch routed-expert weight pages from SSD into the OS page cache in parallel with CPU compute, so the next forward pass finds its expert weights already paged in (effective load time ~0). Predicts the next-token experts from the previous-token router output and issues non-blocking prefetch hints (madvise(WILLNEED) on Linux, PrefetchVirtualMemory on Windows) from a background thread. Only meaningful with --expert-streaming. The first token after load is not prefetched (no prediction available yet); demand-paging handles it as usual. Recommended for decode-heavy workloads on slow SSDs. On DeepSeek-V4 models with hash-routed layers, fixation and prefetch-prediction are automatically skipped for those layers (their expert IDs depend on the input token, not the hidden state).",
++        [](common_params & params) {
++            params.expert_prefetch = true;
++        }
++    ).set_env("LLAMA_ARG_EXPERT_PREFETCH"));
      add_opt(common_arg(
          {"-dio", "--direct-io"},
          {"-ndio", "--no-direct-io"},
 diff --git a/common/common.cpp b/common/common.cpp
-index 8f13217ab..9ba74ba42 100644
+index ff27d392f..377be6dfb 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1566,6 +1566,24 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
+@@ -1603,6 +1603,34 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
      mparams.use_extra_bufts = !params.no_extra_bufts;
      mparams.no_host         = params.no_host;
  
 +    // Expert streaming implies mmap (no mlock) so the OS can page experts
 +    // in/out. Force these on the user's behalf with a warning if they
-+    // requested otherwise.
++    // requested otherwise. In the latest llama.cpp, use_mmap/use_mlock
++    // are encoded in the single `load_mode` enum:
++    //   LLAMA_LOAD_MODE_NONE       -> no mmap, no mlock
++    //   LLAMA_LOAD_MODE_MMAP       -> mmap only
++    //   LLAMA_LOAD_MODE_MLOCK      -> mlock only (no mmap)
++    //   LLAMA_LOAD_MODE_MMAP_MLOCK -> mmap + mlock
 +    if (params.expert_streaming) {
-+        if (!mparams.use_mmap) {
-+            LOG_WRN("%s: --expert-streaming requires mmap; forcing use_mmap = true\n", __func__);
-+            mparams.use_mmap = true;
++        const bool want_mmap  = (mparams.load_mode == LLAMA_LOAD_MODE_MMAP) ||
++                               (mparams.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK);
++        const bool want_mlock = (mparams.load_mode == LLAMA_LOAD_MODE_MLOCK) ||
++                               (mparams.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK);
++        if (!want_mmap) {
++            LOG_WRN("%s: --expert-streaming requires mmap; forcing load_mode = MMAP\n", __func__);
++            mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
 +        }
-+        if (mparams.use_mlock) {
-+            LOG_WRN("%s: --expert-streaming is incompatible with --mlock; forcing use_mlock = false\n", __func__);
-+            mparams.use_mlock = false;
++        if (want_mlock) {
++            LOG_WRN("%s: --expert-streaming is incompatible with mlock; forcing load_mode = MMAP (no mlock)\n", __func__);
++            mparams.load_mode = LLAMA_LOAD_MODE_MMAP;
 +        }
 +    }
 +    mparams.expert_streaming      = params.expert_streaming;
 +    mparams.expert_cache_size_mib = params.expert_cache_size_mib;
 +    mparams.expert_keep_recent    = params.expert_keep_recent;
 +    mparams.expert_fixation       = params.expert_fixation;
++    mparams.expert_prefetch       = params.expert_prefetch;
 +
      if (params.kv_overrides.empty()) {
          mparams.kv_overrides = NULL;
      } else {
 diff --git a/common/common.h b/common/common.h
-index bffc1767a..bec272e12 100644
+index 919c0ea10..539389354 100644
 --- a/common/common.h
 +++ b/common/common.h
-@@ -575,6 +575,26 @@ struct common_params {
-     bool use_mmap          = true;  // enable mmap to use filesystem cache
-     bool use_direct_io     = false; // read from disk without buffering
-     bool use_mlock         = false; // use mlock to keep model in memory
+@@ -571,6 +571,36 @@ struct common_params {
+     bool kv_unified        = false; // enable unified KV cache
+ 
+     bool input_prefix_bos  = false; // prefix BOS to user inputs, preceding input_prefix
++    bool use_mmap          = true;  // enable mmap to use filesystem cache
++    bool use_direct_io     = false; // read from disk without buffering
++    bool use_mlock         = false; // use mlock to keep model in memory
 +
 +    // [EXPERIMENTAL] Expert streaming: skip prefetching routed expert
 +    // weights into RAM at startup. OS demand-pages them from SSD on
@@ -93,18 +113,25 @@ index bffc1767a..bec272e12 100644
 +    // SSD I/O for expert weight loading during the fixation window.
 +    // 0 = disabled. Orthogonal to --override-kv.
 +    int32_t expert_fixation = 0;
++    // [EXPERIMENTAL] Expert prefetch: asynchronously prefetch routed-expert
++    // pages from SSD into the OS page cache in parallel with CPU compute,
++    // using the previous-token router output as the prediction for the
++    // next-token expert selection. Hides SSD read latency behind CPU work
++    // so the next forward pass finds its expert weights already paged in.
++    // Only meaningful with --expert-streaming.
++    bool expert_prefetch = false;
 +
      bool verbose_prompt    = false; // print prompt tokens before generation
      bool display_prompt    = true;  // print prompt before generation
      bool no_kv_offload     = false; // disable KV offloading
 diff --git a/include/llama.h b/include/llama.h
-index a311ac202..15e26a187 100644
+index 6e53e2297..8221b2342 100644
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -328,6 +328,64 @@ extern "C" {
-         bool use_extra_bufts; // use extra buffer types (used for weight repacking)
+@@ -338,6 +338,95 @@ extern "C" {
          bool no_host;         // bypass host buffer allowing extra buffers to be used
          bool no_alloc;        // only load metadata and simulate memory allocations
+         bool load_mtp;        // whether to load MTP layers
 +
 +        // [EXPERIMENTAL] Expert streaming: when true, routed (non-shared)
 +        // expert weights are NOT prefetched into RAM at model load time.
@@ -163,6 +190,37 @@ index a311ac202..15e26a187 100644
 +        // compensate for the accuracy impact of fixation, while
 +        // --expert-fixation eliminates SSD thrash.
 +        int32_t expert_fixation;
++
++        // [EXPERIMENTAL] Expert prefetch: when true, a background thread
++        // asynchronously prefetches routed-expert weight pages from SSD
++        // into the OS page cache in parallel with CPU compute, so the next
++        // forward pass finds its expert weights already paged in (effective
++        // load time ~0).
++        //
++        // Prediction strategy: the per-layer expert IDs selected on the
++        // previous (non-warmup) forward pass are used as the prediction
++        // for the current pass. Adjacent tokens almost always share most of
++        // their routed experts (especially during decode), so this prediction
++        // is highly accurate. The prefetch is issued as a non-blocking OS
++        // hint (madvise(WILLNEED) on Linux, PrefetchVirtualMemory on
++        // Windows), which lets the kernel schedule the SSD reads in the
++        // background while the CPU works through the early layers of the
++        // forward pass.
++        //
++        // The first forward pass after load has no prediction available;
++        // demand-paging handles it as usual. Subsequent passes benefit
++        // from the prediction.
++        //
++        // On DeepSeek-V4 models with hash-routed layers
++        // (dsv4_hash_layer_count > 0), fixation and prefetch-prediction
++        // are automatically skipped for those layers because their expert
++        // IDs depend on the input token, not the hidden state, and cannot
++        // be predicted from the previous token. Non-hash-routed layers
++        // still benefit from both features.
++        //
++        // Only meaningful when expert_streaming = true. Orthogonal to
++        // expert_fixation and expert_keep_recent.
++        bool expert_prefetch;
      };
  
      struct llama_sampler_seq_config {
@@ -179,7 +237,7 @@ index 320784c3a..dd4bb8bb0 100644
              llama-graph.cpp
              llama-hparams.cpp
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
-index eed041eef..6d1939054 100644
+index 19cca7df1..70368e812 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
 @@ -1,6 +1,7 @@
@@ -190,7 +248,7 @@ index eed041eef..6d1939054 100644
  #include "llama-arch.h"
  #include "llama-graph.h"
  #include "llama-impl.h"
-@@ -1194,6 +1195,10 @@ void llama_context::set_warmup(bool value) {
+@@ -1198,6 +1199,10 @@ void llama_context::set_warmup(bool value) {
  
      cparams.warmup = value;
  
@@ -201,7 +259,7 @@ index eed041eef..6d1939054 100644
      // warmups are usually with small batches, so no need to reserve
      //sched_need_reserve = true;
  }
-@@ -2417,21 +2422,23 @@ llm_graph_params llama_context::graph_params(
+@@ -2435,21 +2440,23 @@ llm_graph_params llama_context::graph_params(
              const llama_memory_context_i * mctx,
                            llm_graph_type   gtype) const {
      return {
@@ -240,7 +298,7 @@ index eed041eef..6d1939054 100644
      };
  }
  
-@@ -2461,6 +2468,27 @@ ggml_status llama_context::graph_compute(
+@@ -2479,6 +2486,27 @@ ggml_status llama_context::graph_compute(
  
      // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
  
@@ -270,10 +328,10 @@ index eed041eef..6d1939054 100644
  
 diff --git a/src/llama-expert-stream.cpp b/src/llama-expert-stream.cpp
 new file mode 100644
-index 000000000..26bfb4c8e
+index 000000000..c8294b569
 --- /dev/null
 +++ b/src/llama-expert-stream.cpp
-@@ -0,0 +1,543 @@
+@@ -0,0 +1,733 @@
 +#include "llama-expert-stream.h"
 +
 +#include "llama-impl.h"
@@ -738,6 +796,196 @@ index 000000000..26bfb4c8e
 +    return total;
 +}
 +
++// ---- Async prefetch implementation -----------------------------------------
++//
++// Design overview (see also the header comment):
++//
++//   The previous-token expert selection is a very strong predictor of the
++//   current-token expert selection, because adjacent tokens in causal LM
++//   decoding almost always route through the same experts (the router
++//   weights are unchanged and the hidden state changes slowly). We exploit
++//   this by:
++//
++//     1. After each (non-warmup) forward pass, the main thread calls
++//        record_used(layer, ids, n) for every layer whose top-k selection
++//        it observed via the "ffn_moe_topk-<il>" graph nodes. This
++//        updates predicted_per_layer_ under prefetch_mtx_.
++//
++//     2. Immediately after the LRU maintenance pass, the main thread calls
++//        kickoff_prefetch(), which sets prefetch_kick_ and notifies
++//        prefetch_cv_. This returns immediately -- the actual prefetch
++//        work happens on the worker thread.
++//
++//     3. The worker (prefetch_worker_) wakes up, snapshots
++//        predicted_per_layer_ under the lock, releases the lock, then
++//        issues advise_range_willneed() (madvise(WILLNEED) on Linux,
++//        PrefetchVirtualMemory on Windows) for every (layer, expert_id,
++//        tensor_kind) region in the snapshot. Both of those calls are
++//        non-blocking hints to the OS -- the kernel starts the SSD reads
++//        in the background and the worker thread returns as soon as the
++//        hints are queued.
++//
++//     4. The next forward pass begins on the CPU almost immediately. While
++//        the CPU works through the early layers' router / shared-expert
++//        nodes (which are tiny and RAM-resident), the SSD is busy pulling
++//        in the predicted expert pages for later layers. By the time the
++//        CPU reaches a layer that needs its routed-expert weights, those
++//        pages are already in the page cache (or being paged in), so the
++//        page fault cost is hidden behind the CPU work.
++//
++//   Prediction misses: if the router for layer L on the current token
++//   happens to pick a different expert than was predicted, demand paging
++//   handles it as usual -- the worker has still prefetched the correct
++//   experts for all the layers where the prediction did match (which is
++//   usually most of them), so the net effect is still a large reduction
++//   in SSD-induced stall time.
++//
++//   First token after load: no prediction is available yet, so the worker
++//   has nothing to prefetch. Demand paging handles the first token.
++//   Starting with the second token, the prediction is in place and the
++//   prefetch path kicks in.
++//
++//   Hash-routed layers (DeepSeek-V4 only): expert_stream_collect_used()
++//   skips recording the per-layer expert IDs for these layers because
++//   they are a deterministic function of the INPUT TOKEN, not the hidden
++//   state — the previous token's selection is NOT a valid prediction for
++//   the next token. These layers simply aren't in the snapshot, so the
++//   worker never tries to prefetch for them; they fall back to normal
++//   demand-paging.
++
++void manager::start_prefetch_thread(const llama_mmaps & mappings) {
++    if (prefetch_thread_ != nullptr) {
++        // Already running. Just refresh the mappings pointer in case the
++        // caller is re-initializing (shouldn't happen in practice, but
++        // defensive).
++        std::lock_guard<std::mutex> lk(prefetch_mtx_);
++        prefetch_mappings_ = &mappings;
++        return;
++    }
++    {
++        std::lock_guard<std::mutex> lk(prefetch_mtx_);
++        prefetch_mappings_ = &mappings;
++        prefetch_stop_.store(false, std::memory_order_relaxed);
++        prefetch_kick_.store(false, std::memory_order_relaxed);
++        predicted_per_layer_.clear();
++    }
++    prefetch_thread_ = new std::thread([this] { prefetch_worker_(); });
++    LLAMA_LOG_INFO("expert_stream: async prefetch thread started\n");
++}
++
++void manager::stop_prefetch_thread() {
++    if (prefetch_thread_ == nullptr) {
++        return;
++    }
++    prefetch_stop_.store(true, std::memory_order_relaxed);
++    prefetch_kick_.store(true, std::memory_order_relaxed);
++    prefetch_cv_.notify_all();
++    try {
++        if (prefetch_thread_->joinable()) {
++            prefetch_thread_->join();
++        }
++    } catch (...) {
++        // Swallow — we're tearing down and cannot recover.
++    }
++    delete prefetch_thread_;
++    prefetch_thread_ = nullptr;
++    {
++        std::lock_guard<std::mutex> lk(prefetch_mtx_);
++        prefetch_mappings_ = nullptr;
++        predicted_per_layer_.clear();
++    }
++    LLAMA_LOG_DEBUG("expert_stream: async prefetch thread stopped\n");
++}
++
++void manager::record_used(int layer, const uint32_t * expert_ids, size_t n) {
++    if (expert_ids == nullptr || n == 0) {
++        return;
++    }
++    std::lock_guard<std::mutex> lk(prefetch_mtx_);
++    auto & v = predicted_per_layer_[layer];
++    v.assign(expert_ids, expert_ids + n);
++    // Deduplicate so the worker doesn't issue redundant prefetch hints.
++    std::sort(v.begin(), v.end());
++    v.erase(std::unique(v.begin(), v.end()), v.end());
++}
++
++void manager::kickoff_prefetch() {
++    if (prefetch_thread_ == nullptr) {
++        return;  // Worker not running — nothing to do.
++    }
++    prefetch_kick_.store(true, std::memory_order_relaxed);
++    prefetch_cv_.notify_one();
++}
++
++void manager::prefetch_worker_() {
++    while (true) {
++        // Wait for either a kickoff or a stop request.
++        std::unique_lock<std::mutex> lk(prefetch_mtx_);
++        prefetch_cv_.wait(lk, [this]{
++            return prefetch_stop_.load(std::memory_order_relaxed) ||
++                   prefetch_kick_.load(std::memory_order_relaxed);
++        });
++        if (prefetch_stop_.load(std::memory_order_relaxed)) {
++            return;
++        }
++        prefetch_kick_.store(false, std::memory_order_relaxed);
++
++        // Snapshot the predicted expert set under the lock, then release
++        // it so the main thread can update the prediction for the NEXT
++        // token while we're still issuing hints for THIS token's prefetch.
++        const llama_mmaps * mappings = prefetch_mappings_;
++        std::unordered_map<int, std::vector<uint32_t>> snapshot = predicted_per_layer_;
++        lk.unlock();
++
++        if (mappings == nullptr || mappings->empty()) {
++            continue;
++        }
++        if (snapshot.empty()) {
++            // No prediction yet (first token, or all layers are
++            // hash-routed). Skip.
++            continue;
++        }
++
++        // Issue prefetch hints. We iterate layers in ascending order so
++        // the kernel prioritizes reading the layers the CPU will reach
++        // first. Each hint is a non-blocking OS call; if the kernel is
++        // already busy with previous hints, this just queues more.
++        //
++        // We re-check prefetch_stop_ between layers so a stop request
++        // (e.g. model teardown) is observed promptly even when the
++        // snapshot is large.
++        std::vector<int> layers;
++        layers.reserve(snapshot.size());
++        for (const auto & [layer, ids] : snapshot) {
++            layers.push_back(layer);
++        }
++        std::sort(layers.begin(), layers.end());
++
++        size_t hints_issued = 0;
++        for (int layer : layers) {
++            if (prefetch_stop_.load(std::memory_order_relaxed)) {
++                return;
++            }
++            const auto & ids = snapshot[layer];
++            for (uint32_t eid : ids) {
++                // Issue prefetch for all four tensor kinds. find_region()
++                // returns SIZE_MAX for kinds the model doesn't have (e.g.
++                // gate_up is fused-only in some architectures), so those
++                // are silently skipped.
++                for (int kind = 0; kind < 4; ++kind) {
++                    size_t idx = find_region(layer, eid, kind);
++                    if (idx == SIZE_MAX) continue;
++                    const auto & r = regions_[idx];
++                    advise_range_willneed(region_addr(*mappings, r), r.length);
++                    ++hints_issued;
++                }
++            }
++        }
++        LLAMA_LOG_DEBUG("expert_stream: async prefetch issued %zu page hints across %zu layers\n",
++            hints_issued, layers.size());
++    }
++}
++
 +// ---- Expert fixation (v7 graph-node based) --------------------------------
 +
 +void fixation_apply(struct ggml_tensor * dst, const struct ggml_tensor * a, int ith, int nth, void * userdata) {
@@ -819,10 +1067,10 @@ index 000000000..26bfb4c8e
 +} // namespace llama_expert_stream
 diff --git a/src/llama-expert-stream.h b/src/llama-expert-stream.h
 new file mode 100644
-index 000000000..e7261b755
+index 000000000..bd0714bf4
 --- /dev/null
 +++ b/src/llama-expert-stream.h
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,385 @@
 +#pragma once
 +
 +// Expert Streaming for MoE models
@@ -847,9 +1095,11 @@ index 000000000..e7261b755
 +#include "ggml.h"
 +
 +#include <atomic>
++#include <condition_variable>
 +#include <cstdint>
 +#include <cstddef>
 +#include <string>
++#include <thread>
 +#include <unordered_map>
 +#include <unordered_set>
 +#include <list>
@@ -1005,7 +1255,49 @@ index 000000000..e7261b755
 +    // For debugging: number of experts currently marked resident.
 +    size_t lru_resident_count() const;
 +
++    // ---- Async prefetch API -------------------------------------------------
++    //
++    // A background thread that, once kicked, issues non-blocking prefetch
++    // hints (madvise(WILLNEED) on Linux, PrefetchVirtualMemory on Windows)
++    // for the predicted next-token expert pages, so the SSD reads overlap
++    // with the next forward pass's CPU compute. The prediction is simply
++    // the previous-token expert selection (recorded via record_used()).
++    //
++    // start_prefetch_thread() spawns the worker; it then sleeps on a
++    // condition variable until kickoff_prefetch() is called.
++    // kickoff_prefetch() snapshots the most recently recorded per-layer
++    // expert IDs and wakes the worker. The worker issues prefetch hints
++    // for every (layer, expert_id, tensor_kind) region in the snapshot.
++    // stop_prefetch_thread() must be called before the mappings are
++    // destroyed (it is invoked from ~impl()).
++
++    // Spawn the background prefetch worker. Idempotent; safe to call when
++    // already running. The mappings pointer must outlive the worker
++    // (i.e. must be the model's own pimpl->mappings).
++    void start_prefetch_thread(const llama_mmaps & mappings);
++
++    // Stop and join the background prefetch worker. Idempotent.
++    void stop_prefetch_thread();
++
++    // Record which experts were used per layer in the most recent
++    // (non-warmup) forward pass. This snapshot is the prediction used by
++    // the next kickoff_prefetch(). Thread-safe. Cheap: O(n_active_layers
++    // * n_expert_per_layer) under a short mutex. Safe to call without
++    // start_prefetch_thread() having been called (the snapshot is just
++    // not consumed until the worker is running).
++    void record_used(int layer, const uint32_t * expert_ids, size_t n);
++
++    // Wake the background worker (if running) to issue prefetch hints
++    // for the most recently recorded per-layer expert set. Returns
++    // immediately (the prefetch work happens on the worker thread).
++    void kickoff_prefetch();
++
++    // Whether the prefetch worker is currently running.
++    bool prefetch_thread_running() const { return prefetch_thread_ != nullptr; }
++
 +private:
++    void prefetch_worker_();
++
 +    std::vector<expert_region> regions_;
 +    // Index: layer -> list of indices into regions_
 +    std::unordered_map<int, std::vector<size_t>> layer_index_;
@@ -1031,6 +1323,39 @@ index 000000000..e7261b755
 +    // tensor_kind: 0=gate_exps, 1=up_exps, 2=down_exps, 3=gate_up_exps
 +    // Returns SIZE_MAX if not found. O(1) via region_index_.
 +    size_t find_region(int layer, uint32_t expert_id, int tensor_kind) const;
++
++    // ---- Async prefetch state ----------------------------------------------
++    //
++    // The worker thread issues non-blocking prefetch hints (madvise /
++    // PrefetchVirtualMemory) for the predicted next-token expert pages,
++    // so the SSD reads overlap with the next forward pass's CPU compute.
++    //
++    // Lifecycle:
++    //   - start_prefetch_thread() sets prefetch_mappings_ and spawns the
++    //     worker, which sleeps on prefetch_cv_ until kickoff_prefetch().
++    //   - record_used() updates predicted_per_layer_ under prefetch_mtx_.
++    //   - kickoff_prefetch() sets prefetch_kick_=true and notifies prefetch_cv_.
++    //   - The worker wakes, snapshots predicted_per_layer_ under the lock,
++    //     releases the lock, and issues prefetch hints for every region
++    //     in the snapshot. While issuing hints it checks prefetch_stop_
++    //     after each layer so a stop request is observed promptly.
++    //   - stop_prefetch_thread() sets prefetch_stop_=true, notifies
++    //     prefetch_cv_, and joins the worker.
++    //
++    // The worker never touches regions_ or region_index_ mutably, so it
++    // safely concurrent with the (read-only) find_region() lookups made
++    // during the prefetch pass. The mmap regions themselves are stable
++    // for the worker's lifetime (start...stop bracket the model's
++    // resident period).
++    const llama_mmaps * prefetch_mappings_ = nullptr;
++    std::thread * prefetch_thread_ = nullptr;
++    std::mutex prefetch_mtx_;
++    std::condition_variable prefetch_cv_;
++    std::atomic<bool> prefetch_stop_{false};
++    std::atomic<bool> prefetch_kick_{false};
++    // Predicted next-token expert IDs per layer. Updated by record_used(),
++    // snapshotted by the worker at kickoff time.
++    std::unordered_map<int, std::vector<uint32_t>> predicted_per_layer_;
 +};
 +
 +// ---------------------------------------------------------------------------
@@ -1132,10 +1457,10 @@ index 000000000..e7261b755
 +
 +} // namespace llama_expert_stream
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index c8ecb0a28..ffc589315 100644
+index e12a8cdc2..ceed02c95 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -1357,6 +1357,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
+@@ -1426,6 +1426,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
      loras            (params.loras),
      mctx             (params.mctx),
      cross            (params.cross),
@@ -1144,7 +1469,7 @@ index c8ecb0a28..ffc589315 100644
      samplers         (params.samplers),
      cb_func          (params.cb),
      res              (params.res),
-@@ -1915,6 +1917,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+@@ -1995,6 +1997,46 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
          cb(selected_experts->src[0], "ffn_moe_argsort", il);
      }
@@ -1166,8 +1491,24 @@ index c8ecb0a28..ffc589315 100644
 +    // both the mul_mat_id calls below and expert_stream_collect_used()'s
 +    // LRU bookkeeping -- transparently see whichever selection is actually
 +    // used to compute this token, fixation-overridden or not.
++    //
++    // IMPORTANT: fixation is ONLY safe when the selection was produced by
++    // the router's argsort_top_k (i.e. selected_experts_in == nullptr).
++    // When selected_experts_in is non-null — which happens on DeepSeek-V4
++    // hash-routed layers (selected_experts = ggml_get_rows(tid2eid, tokens))
++    // — the per-token expert IDs are a deterministic function of the
++    // INPUT TOKEN, not the hidden state. Reusing token N's IDs on
++    // token N+1 would feed out-of-range expert indices into mul_mat_id,
++    // tripping GGML_ASSERT(i01 >= 0 && i01 < ne01) in ops.cpp. We
++    // therefore skip the fixation node entirely on the hash-routed path;
++    // those layers see no SSD I/O benefit from fixation anyway (their
++    // expert IDs depend only on token IDs, which we cannot predict from
++    // the previous token either, so expert-prefetch also skips them via
++    // the same `selected_experts_in != nullptr` check in
++    // expert_stream_collect_used()).
 +    if (expert_fixation_state != nullptr && il >= 0 &&
-+        expert_fixation_node_args != nullptr && (size_t) il < expert_fixation_node_args->size()) {
++        expert_fixation_node_args != nullptr && (size_t) il < expert_fixation_node_args->size() &&
++        selected_experts_in == nullptr) {
 +        selected_experts = ggml_map_custom1(ctx0, selected_experts,
 +            llama_expert_stream::fixation_apply, /*n_tasks=*/1,
 +            (void *) &(*expert_fixation_node_args)[il]);
@@ -1176,7 +1517,7 @@ index c8ecb0a28..ffc589315 100644
  
      if (arch == LLM_ARCH_GROVEMOE && n_expert != hparams.n_expert) {
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 7ed490ce6..aa72d1bdb 100644
+index 160e29413..798ab7b81 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
 @@ -4,6 +4,7 @@
@@ -1187,7 +1528,7 @@ index 7ed490ce6..aa72d1bdb 100644
  
  #include <cstdint>
  #include <vector>
-@@ -688,6 +689,14 @@ struct llm_graph_params {
+@@ -731,6 +732,14 @@ struct llm_graph_params {
      const llama_memory_context_i * mctx;
      const llama_cross            * cross;
  
@@ -1202,7 +1543,7 @@ index 7ed490ce6..aa72d1bdb 100644
      std::map<llama_seq_id, llama_sampler *> samplers;
  
      static bool samplers_equal(
-@@ -928,6 +937,11 @@ struct llm_graph_context {
+@@ -971,6 +980,11 @@ struct llm_graph_context {
      const llama_memory_context_i * mctx;
      const llama_cross            * cross;
  
@@ -1215,18 +1556,18 @@ index 7ed490ce6..aa72d1bdb 100644
  
      const llm_graph_cb & cb_func;
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 28f8bb793..a55fb8db5 100644
+index df8313e81..5c0a94dc0 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -4,6 +4,7 @@
- #include "ggml.h"
+@@ -5,6 +5,7 @@
  #include "gguf.h"
  #include "llama-hparams.h"
+ #include "llama.h"
 +#include "llama-expert-stream.h"
  
  #include <algorithm>
  #include <array>
-@@ -11,6 +12,7 @@
+@@ -12,6 +13,7 @@
  #include <cstdint>
  #include <cstring>
  #include <future>
@@ -1234,7 +1575,7 @@ index 28f8bb793..a55fb8db5 100644
  #include <regex>
  
  static const size_t kiB = 1024;
-@@ -1417,7 +1419,8 @@ bool llama_model_loader::load_all_data(
+@@ -1406,7 +1408,8 @@ bool llama_model_loader::load_all_data(
          llama_buf_map & bufs,
          llama_mlocks * lmlocks,
          llama_progress_callback progress_callback,
@@ -1244,7 +1585,7 @@ index 28f8bb793..a55fb8db5 100644
      if (files.empty()) {
          for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
              set_tensor_data(t, set_tensor_data_ud);
-@@ -1540,6 +1543,27 @@ bool llama_model_loader::load_all_data(
+@@ -1529,6 +1532,27 @@ bool llama_model_loader::load_all_data(
              }
          }
  
@@ -1272,7 +1613,7 @@ index 28f8bb793..a55fb8db5 100644
          size_t n_size = ggml_nbytes(cur);
  
          if (use_mmap) {
-@@ -1550,7 +1574,7 @@ bool llama_model_loader::load_all_data(
+@@ -1539,7 +1563,7 @@ bool llama_model_loader::load_all_data(
              }
              uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
  
@@ -1281,7 +1622,7 @@ index 28f8bb793..a55fb8db5 100644
                  validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                      return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                  }));
-@@ -1558,19 +1582,40 @@ bool llama_model_loader::load_all_data(
+@@ -1547,19 +1571,40 @@ bool llama_model_loader::load_all_data(
  
              GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
              if (buf_mmap && cur->data == nullptr) {
@@ -1324,7 +1665,7 @@ index 28f8bb793..a55fb8db5 100644
              const auto & file = files.at(weight->idx);
  
              if (ggml_backend_buffer_is_host(cur->buffer)) {
-@@ -1675,8 +1720,12 @@ bool llama_model_loader::load_all_data(
+@@ -1664,8 +1709,12 @@ bool llama_model_loader::load_all_data(
  
      // check if this is the last call and do final cleanup
      if (size_done >= size_data) {
@@ -1340,10 +1681,10 @@ index 28f8bb793..a55fb8db5 100644
                  const auto & mmap_used = mmaps_used.at(idx);
                  auto & mapping = mappings.at(idx);
 diff --git a/src/llama-model-loader.h b/src/llama-model-loader.h
-index c476026d3..8cb22ab68 100644
+index 7ad380782..b3a583add 100644
 --- a/src/llama-model-loader.h
 +++ b/src/llama-model-loader.h
-@@ -194,12 +194,17 @@ struct llama_model_loader {
+@@ -195,12 +195,17 @@ struct llama_model_loader {
      void load_data_for(struct ggml_tensor * cur) const;
  
      // Returns false if cancelled by progress_callback
@@ -1363,7 +1704,7 @@ index c476026d3..8cb22ab68 100644
      std::string ftype_name() const;
  
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
-index 7e5bab26c..73467071d 100644
+index e93641b63..1830bcdba 100644
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
 @@ -7,6 +7,7 @@
@@ -1374,7 +1715,26 @@ index 7e5bab26c..73467071d 100644
  
  #include "llama-kv-cache.h"
  #include "llama-kv-cache-iswa.h"
-@@ -1030,6 +1031,32 @@ struct llama_model::impl {
+@@ -35,6 +36,7 @@
+ #include <sstream>
+ #include <stdexcept>
+ #include <string>
++#include <unordered_set>
+ #include <vector>
+ 
+ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params & params) {
+@@ -1002,7 +1004,9 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
+ 
+ struct llama_model::impl {
+     impl() = default;
+-    ~impl() = default;
++    // Custom destructor defined out-of-line below — must stop the async
++    // prefetch worker before any member (esp. mappings) is destroyed.
++    ~impl();
+ 
+     uint64_t n_elements = 0;
+ 
+@@ -1037,6 +1041,49 @@ struct llama_model::impl {
      bool has_tensor_overrides;
  
      std::vector<float> tensor_split_owned;
@@ -1385,6 +1745,18 @@ index 7e5bab26c..73467071d 100644
 +    bool expert_stream_init = false;
 +    int32_t expert_cache_size_mib = 0;
 +    int32_t expert_keep_recent = 0;
++    // Expert prefetch: when true, a background worker issues non-blocking
++    // OS prefetch hints (madvise(WILLNEED) on Linux, PrefetchVirtualMemory
++    // on Windows) for the predicted next-token routed-expert pages, so the
++    // SSD reads overlap with the next forward pass's CPU compute and the
++    // next pass finds its expert weights already paged in.
++    bool expert_prefetch = false;
++    // Set of layer indices that are hash-routed (DeepSeek-V4 only): for
++    // these layers the per-token expert IDs depend only on the INPUT TOKEN
++    // (via ffn_gate_tid2eid), not on the hidden state, so they cannot be
++    // predicted from the previous token. We skip both fixation and
++    // prefetch prediction for these layers.
++    std::unordered_set<int> expert_hash_routed_layers;
 +
 +    // Expert fixation state (v7).
 +    //
@@ -1404,12 +1776,39 @@ index 7e5bab26c..73467071d 100644
 +    // here in a vector that is never reallocated after load).
 +    llama_expert_stream::fixation_state expert_fixation_state;
 +    std::vector<llama_expert_stream::fixation_node_args> expert_fixation_node_args;
++
++    // impl destructor is declared at the top of this struct (out-of-line
++    // definition below) — it must stop the async prefetch worker BEFORE
++    // any member (esp. mappings) is destroyed, otherwise the worker would
++    // dereference a dangling mappings pointer.
  };
  
  llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
-@@ -1256,8 +1283,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
-     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
-         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
+@@ -1049,6 +1096,21 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
+     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
+ }
+ 
++// Defined out-of-line because the destructor body needs to see the full
++// definition of llama_expert_stream::manager (which is included via
++// llama-expert-stream.h) — keeping it inline in the struct would force
++// every translation unit that includes llama-model.h to also pull in
++// <thread>, <condition_variable>, etc.
++//
++// impl is declared as `protected:` in llama-model.h, so ~impl() must be
++// defined as a member function of llama_model (which has access), not as
++// a free function.
++llama_model::impl::~impl() {
++    if (expert_stream_init) {
++        expert_stream_mgr.stop_prefetch_thread();
++    }
++}
++
+ llama_model::~llama_model() {
+     for (auto * lora : loras) {
+         delete lora;
+@@ -1265,8 +1327,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (load_mode = %s)\n",
+         __func__, llama_load_mode_name(params.load_mode));
  
 +    // Expert streaming requires mmap demand paging. Extra buffer types
 +    // (used for weight repacking) would copy tensors into separate buffers
@@ -1428,7 +1827,7 @@ index 7e5bab26c..73467071d 100644
      for (const auto & dev : devices) {
          buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
          // add CPU buffer types as a fallback
-@@ -1517,9 +1555,61 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1526,9 +1599,104 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -1468,6 +1867,29 @@ index 7e5bab26c..73467071d 100644
 +            pimpl->expert_fixation_node_args[il].state = &pimpl->expert_fixation_state;
 +            pimpl->expert_fixation_node_args[il].il    = (int) il;
 +        }
++        // DeepSeek-V4: detect hash-routed layers (those that have a
++        // ffn_gate_tid2eid tensor). For these layers the per-token expert
++        // IDs are a deterministic function of the INPUT TOKEN (via the
++        // tid2eid lookup table), not the hidden state. This means:
++        //   (1) --expert-fixation cannot safely reuse the cached top-k
++        //       (different tokens need different experts; reusing would
++        //       trip GGML_ASSERT(i01 >= 0 && i01 < ne01) in mul_mat_id).
++        //   (2) --expert-prefetch cannot predict the next-token expert IDs
++        //       from the current-token expert IDs (they depend on the
++        //       next input token, which we don't know).
++        // We therefore record these layer indices and skip both fixation
++        // (build_moe_ffn checks selected_experts_in == nullptr) and
++        // prefetch prediction (expert_stream_collect_used checks the
++        // hash-routed set) for them. The features still work normally on
++        // the non-hash-routed layers (typically the deeper layers, where
++        // hash routing is disabled in favor of learned routing).
++        pimpl->expert_hash_routed_layers.clear();
++        for (size_t il = 0; il < n_layer; ++il) {
++            const std::string tid2eid_name = "blk." + std::to_string(il) + ".ffn_gate_tid2eid.weight";
++            if (ml.weights_map.find(tid2eid_name) != ml.weights_map.end()) {
++                pimpl->expert_hash_routed_layers.insert((int) il);
++            }
++        }
 +        if (!pimpl->expert_stream_init) {
 +            LLAMA_LOG_WARN("%s: --expert-streaming requested but no routed expert tensors detected; falling back to normal load\n", __func__);
 +        } else {
@@ -1485,13 +1907,33 @@ index 7e5bab26c..73467071d 100644
 +                        "Use -ngl 0 with --expert-streaming.\n", __func__, params.n_gpu_layers);
 +                }
 +            }
++            // Expert prefetch: spawn the background worker that issues
++            // non-blocking OS prefetch hints for the predicted next-token
++            // routed-expert pages. The worker sleeps on a condition
++            // variable until kickoff_prefetch() is called from
++            // expert_stream_post_compute() after each forward pass.
++            //
++            // We start the thread AFTER pimpl->mappings is populated
++            // (below) — actually we have to wait until pimpl->mappings is
++            // filled, which happens later in this function. So we defer
++            // the start_prefetch_thread() call until after the
++            // post-load eviction block below.
++            pimpl->expert_prefetch = params.expert_prefetch;
++            if (pimpl->expert_prefetch) {
++                LLAMA_LOG_INFO("%s: expert prefetch enabled — background worker will prefetch predicted next-token expert pages (effective load time ~0 after the first token)\n",
++                    __func__);
++            }
++            if (!pimpl->expert_hash_routed_layers.empty()) {
++                LLAMA_LOG_INFO("%s: %zu hash-routed MoE layer(s) detected — fixation and prefetch-prediction are skipped for these layers (their expert IDs depend on the input token, not the hidden state)\n",
++                    __func__, pimpl->expert_hash_routed_layers.size());
++            }
 +        }
 +    }
 +
      // create the backend buffers
      std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
      ctx_buf_maps.reserve(ml.ctx_map.size());
-@@ -1641,7 +1731,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1650,7 +1818,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
  
      // load tensor data
      for (auto & [ctx, buf_map] : ctx_buf_maps) {
@@ -1500,7 +1942,7 @@ index 7e5bab26c..73467071d 100644
              return false;
          }
      }
-@@ -1652,6 +1742,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+@@ -1661,6 +1829,28 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
          }
      }
  
@@ -1517,12 +1959,19 @@ index 7e5bab26c..73467071d 100644
 +        if (pimpl->expert_cache_size_mib > 0) {
 +            LLAMA_LOG_INFO("%s: expert cache target = %d MiB\n", __func__, pimpl->expert_cache_size_mib);
 +        }
++        // Spawn the background prefetch worker now that pimpl->mappings is
++        // populated. The worker will sleep until the first non-warmup
++        // forward pass completes and kickoff_prefetch() is called from
++        // expert_stream_post_compute(). Stopping it is handled by ~impl().
++        if (pimpl->expert_prefetch) {
++            pimpl->expert_stream_mgr.start_prefetch_thread(pimpl->mappings);
++        }
 +    }
 +
      return true;
  }
  
-@@ -2307,6 +2412,133 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
+@@ -2420,6 +2610,180 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
      return llm->res->get_gf();
  }
  
@@ -1550,12 +1999,37 @@ index 7e5bab26c..73467071d 100644
 +            mappings,
 +            (size_t) target_mib * 1024 * 1024);
 +    }
++
++    // Expert prefetch: kick off the background worker to issue non-blocking
++    // OS prefetch hints for the predicted next-token expert pages. The
++    // prediction was just refreshed by expert_stream_collect_used() above
++    // (called before this from llama_context::graph_compute). This call
++    // returns immediately — the prefetch work happens on the worker thread,
++    // overlapping with the next forward pass's CPU compute.
++    if (pimpl->expert_prefetch) {
++        pimpl->expert_stream_mgr.kickoff_prefetch();
++    }
 +}
 +
 +// Scan the computed graph for "ffn_moe_topk-<il>" tensors and notify the
 +// expert-stream manager of which experts were used per layer.
++//
++// This both updates the LRU keep-recent state (when enabled) AND records
++// the per-layer expert IDs as the prediction for the next-token prefetch
++// (when --expert-prefetch is enabled). The graph scan is therefore run
++// when EITHER feature is enabled.
++//
++// Hash-routed layers (DeepSeek-V4 only) are explicitly skipped: their
++// expert IDs are a deterministic function of the INPUT TOKEN (via the
++// ffn_gate_tid2eid lookup table), not the hidden state, so the previous
++// token's selection is NOT a valid prediction for the next token.
 +void llama_model::expert_stream_collect_used(struct ggml_cgraph * gf) const {
-+    if (!pimpl->expert_stream_init || pimpl->expert_keep_recent == 0) {
++    if (!pimpl->expert_stream_init) {
++        return;
++    }
++    // Skip the scan entirely if neither keep-recent nor prefetch needs the
++    // per-layer expert IDs.
++    if (pimpl->expert_keep_recent == 0 && !pimpl->expert_prefetch) {
 +        return;
 +    }
 +    if (!gf) {
@@ -1571,6 +2045,16 @@ index 7e5bab26c..73467071d 100644
 +        const size_t plen = sizeof(prefix) - 1;
 +        if (strncmp(tname, prefix, plen) != 0) continue;
 +        int il = atoi(tname + plen);
++        // Skip hash-routed layers (DeepSeek-V4): their expert IDs depend
++        // on the input token, not the hidden state, so they are not
++        // useful as a prediction for the next token. They are also not
++        // useful for LRU bookkeeping since the same expert may be
++        // repeatedly used by different tokens due to the hash table
++        // structure (LRU is harmless but pointless here, and skipping
++        // saves the per-token scan cost).
++        if (pimpl->expert_hash_routed_layers.count(il)) {
++            continue;
++        }
 +        if (t->type != GGML_TYPE_I32) continue;
 +        if (t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
 +            continue;
@@ -1590,7 +2074,19 @@ index 7e5bab26c..73467071d 100644
 +        std::sort(ids.begin(), ids.end());
 +        ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 +        if (!ids.empty()) {
-+            pimpl->expert_stream_mgr.notify_used(il, (const uint32_t *) ids.data(), ids.size());
++            // LRU keep-recent bookkeeping (no-op when keep_recent == 0,
++            // checked inside notify_used).
++            if (pimpl->expert_keep_recent > 0) {
++                pimpl->expert_stream_mgr.notify_used(il, (const uint32_t *) ids.data(), ids.size());
++            }
++            // Prefetch prediction: record the per-layer expert IDs as
++            // the prediction for the next-token expert selection. The
++            // background worker (if started) will issue prefetch hints
++            // for these regions when kickoff_prefetch() is called from
++            // expert_stream_post_compute().
++            if (pimpl->expert_prefetch) {
++                pimpl->expert_stream_mgr.record_used(il, (const uint32_t *) ids.data(), ids.size());
++            }
 +        }
 +    }
 +}
@@ -1656,22 +2152,23 @@ index 7e5bab26c..73467071d 100644
  
  //
  // interface implementation
-@@ -2331,6 +2563,10 @@ llama_model_params llama_model_default_params() {
-         /*.use_extra_bufts             =*/ true,
+@@ -2443,6 +2807,11 @@ llama_model_params llama_model_default_params() {
          /*.no_host                     =*/ false,
          /*.no_alloc                    =*/ false,
+         /*.load_mtp                    =*/ false,
 +        /*.expert_streaming            =*/ false,
 +        /*.expert_cache_size_mib       =*/ 0,
 +        /*.expert_keep_recent          =*/ 0,
 +        /*.expert_fixation             =*/ 0,
++        /*.expert_prefetch             =*/ false,
      };
  
      return result;
 diff --git a/src/llama-model.h b/src/llama-model.h
-index 45b054ced..635e3e048 100644
+index 056a6efa5..8c2f3b506 100644
 --- a/src/llama-model.h
 +++ b/src/llama-model.h
-@@ -672,6 +672,47 @@ struct llama_model {
+@@ -686,6 +686,47 @@ struct llama_model {
  
      ggml_cgraph * build_graph(const llm_graph_params & params) const;
  
