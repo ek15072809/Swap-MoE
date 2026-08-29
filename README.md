@@ -7,7 +7,7 @@
 **Run 200B+ parameter Mixture-of-Experts models on a 16GB RAM consumer PC — no GPU required.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
-[![llama.cpp](https://img.shields.io/badge/llama.cpp-221f0f635-blue)](https://github.com/ggml-org/llama.cpp)
+[![llama.cpp](https://img.shields.io/badge/llama.cpp-f5e85d43a-blue)](https://github.com/ggml-org/llama.cpp)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20Windows-lightgrey)]()
 
 [Overview](#overview) •
@@ -52,6 +52,8 @@ practical token rates:
 | Qwen3.5-122B-A10B  | Q2_K   | 42.6 GB | ❌ fails to launch | ✅ 2.00 tok/s |
 | MiniMax-2.7        | IQ1_M  | 60.7 GB | ❌ fails to launch | ✅ 0.75 tok/s |
 | DeepSeek-V4-Flash-0731 | IQ1_M | 80.9 GB | ❌ fails to launch | ✅ 0.55 tok/s |
+| Qwen3.8-Flash-Next | IQ1_M | 69.4 GB | ❌ fails to launch | ✅ 0.63 tok/s |
+
 
 See [Benchmarks](#benchmarks) below and the [technical report](#technical-report)
 for the full methodology and additional configurations.
@@ -93,12 +95,23 @@ This is enabled with a single flag:
 --expert-streaming
 ```
 
-Supported on any MoE architecture that uses the standard `ffn_*_exps` tensor
-naming, including **Qwen3-MoE**, **Qwen3.5-MoE**, **MiniMax-M2 / M2.7**,
-**DeepSeek-V2 / V3 / V4**, **Laguna-S-2.1** and so on. Note that DeepSeek-V4's
-hash-routed layers have some caveats around Expert Fixation and Expert
-Prefetch — see [Expert Prefetch](#4-expert-prefetch--hiding-ssd-latency-behind-compute)
-below.
+Supported on any MoE architecture that uses the standard `ffn_*_exps.weight` tensor
+naming, including **Qwen3.8-Flash-Next (qwen4exp)**, **Qwen3-MoE**, **Qwen3.5-MoE**,
+**MiniMax-M2 / M2.7**, **DeepSeek-V2 / V3 / V4**, **Laguna-S-2.1** and so on.
+Note that DeepSeek-V4's hash-routed layers have some caveats around Expert Fixation
+and Expert Prefetch — see
+[Expert Prefetch](#4-expert-prefetch--hiding-ssd-latency-behind-compute) below.
+
+> **Qwen3.8-Flash-Next (`qwen4exp`) notes:** all of its layers are MoE layers built
+> through llama.cpp's standard `build_moe_ffn()` router path, so all four Swap-MoE
+> mechanisms (Streaming, Keep-recent, Fixation, Prefetch) work on it without any
+> special-casing. Its other architectural novelties — hyper-connections (a 4x-wide
+> residual stream replacing every layer norm), QSA sparse attention on the
+> full-attention layers, PLE n-gram hash embeddings, and the Qwen3.5-style hybrid
+> gated-delta-net + full-attention memory — are orthogonal to expert routing and
+> require no Swap-MoE changes. NVFP4-style per-expert scale tensors
+> (`blk.%d.ffn_*_exps.scale`) are deliberately *not* streamed: they are tiny, and
+> keeping them resident avoids mis-tracking them as expert 0's weight region.
 
 ### 2. LRU keep-recent — explicit RAM budget per layer
 
@@ -210,8 +223,8 @@ Swap-MoE is distributed as a single patch file, `llama.cpp-expert-streaming.patc
 against a specific llama.cpp commit. It is **not** a standalone fork — you
 apply it to your own llama.cpp checkout.
 
-> **This release targets llama.cpp commit `221f0f635`.
-> The previous release targeted `1f66c3c`.**
+> **This release targets llama.cpp commit `f5e85d43a` (2026-08-28).
+> The previous release targeted `221f0f635`.**
 
 ### Requirements
 
@@ -230,7 +243,7 @@ apply it to your own llama.cpp checkout.
 # 1. Clone llama.cpp and check out the exact commit this patch targets
 git clone https://github.com/ggml-org/llama.cpp.git
 cd llama.cpp
-git checkout 221f0f635
+git checkout f5e85d43a
 
 # 2. Apply the Swap-MoE patch
 git apply /path/to/llama.cpp-expert-streaming.patch
@@ -249,40 +262,74 @@ cmake --build build --config Release -j"$(nproc)"
 # or build\bin\Release\llama-cli.exe (Windows)
 ```
 
-> **Note:** This patch must be applied to llama.cpp at commit `221f0f635`.
+> **Note:** This patch must be applied to llama.cpp at commit `f5e85d43a`.
 > Applying it to a different commit may fail or silently produce incorrect
 > results, since it touches internal loader and graph-building code that
 > changes frequently upstream.
 >
-> **What changed vs the previous release (`1f66c3c`):**
-> - Added the new `--expert-prefetch` flag: a background thread that
->   asynchronously prefetches the predicted next-pass routed experts into
->   the OS page cache while CPU compute for the current pass is still
->   running, hiding most of the SSD page-fault latency that Expert Streaming
->   alone still incurs. See [Expert Prefetch](#4-expert-prefetch--hiding-ssd-latency-behind-compute).
-> - Added support for **DeepSeek-V4** (including its hash-routed layers).
->   Since a hash-routed layer's expert selection depends on the input token
->   rather than the hidden state, it cannot be predicted from the previous
->   pass — Expert Fixation and Expert Prefetch are automatically disabled
->   for those specific layers, while Expert Streaming and Expert Prefetch's
->   non-hash-routed layers are unaffected.
-> - All other hunks carried over from the `1f66c3c` release apply cleanly.
+> **What changed vs the previous release (`221f0f635`):**
+> - Ported the whole patch set to llama.cpp `f5e85d43a` (2026-08-28 master).
+>   Upstream churn absorbed by this port includes: the `llama_load_mode`
+>   enum migration in `include/llama.h` / `common/common.*`, the
+>   `build_moe_ffn()` signature growth (per-expert NVFP4 scales and biases,
+>   plus the GROVEMOE grouped-routing block now sitting downstream of the
+>   fixation node), the `llm_graph_params` field additions in
+>   `llama-graph.h`, the `graph_params()` / `graph_compute()` reshuffles in
+>   `llama-context.cpp`, and the loader's `load_all_data()` rework in
+>   `llama-model-loader.cpp`. All Swap-MoE flags, semantics and log lines
+>   are unchanged.
+> - Added full support for **Qwen3.8-Flash-Next** (`qwen4exp`, added
+>   upstream in `6c84c7d5d` — *model: add Qwen3.8-Flash-Next*). The model's
+>   routed experts use the standard `ffn_*_exps.weight` naming and its
+>   standard router (no hash routing), so Expert Streaming, Keep-recent,
+>   Fixation and Prefetch all apply to every layer with no special-casing.
+>   Its other novelties (hyper-connections, QSA sparse attention, PLE
+>   n-gram hash embeddings, hybrid gated-delta-net memory) are orthogonal
+>   to expert routing. See the note in
+>   [Expert Streaming](#1-expert-streaming--on-demand-paging-via-mmap).
+> - Hardened `is_routed_expert_tensor()`: routed-expert classification now
+>   requires the `.weight` suffix (with a legacy unsuffixed fallback).
+>   Previously the NVFP4 per-expert scale tensors (`ffn_*_exps.scale`)
+>   and per-expert bias tensors (`ffn_*_exps.bias`, e.g. OpenAI-MoE)
+>   matched the bare substring patterns. The 1-D `.scale` tensors would
+>   be mis-sliced as a single "expert 0" region whose
+>   `(layer, expert_id=0, tensor_kind)` key collides with the real weight
+>   region in the manager's region index, silently redirecting LRU
+>   eviction / prefetch of expert 0 to the wrong bytes. Those variants are
+>   tiny and are now always kept resident in RAM.
+> - All other hunks carried over from the `221f0f635` release.
 >
-> Verified by building llama.cpp `221f0f635` with the patch applied
-> (CPU-only Release build) and exercising the patched code paths with a
-> synthetic Qwen2-MoE GGUF:
+> Verified by building llama.cpp `f5e85d43a` with the patch applied
+> (CPU-only Release build) and exercising the patched code paths with
+> synthetic GGUFs generated by llama.cpp's own `test-llama-archs` tool
+> (`qwen4exp-moe`, plus `qwen2moe`, `qwen35moe` and `deepseek4` as
+> regressions):
 > - `--expert-streaming` triggers `expert streaming enabled — skipping initial
->   mmap prefetch for routed expert tensors` and `expert_stream: tracking 24
->   routed expert slices`.
+>   mmap prefetch for routed expert tensors` and `expert_stream: tracking 8
+>   routed expert slices` (2 layers × 2 tensors × 2 experts on the test
+>   model), followed by `evicting routed expert pages from RAM`.
 > - `--expert-keep-recent 2` triggers `expert keep-recent window = 2 experts
 >   per layer`.
 > - `--expert-fixation 4` triggers `expert fixation active — top-k pinned for
->   the first 4 forward passes`, and the per-layer fixation graph nodes are
->   inserted (graph node count rises from 106 → 108 for a 2-layer test model).
-> - `--expert-prefetch` triggers `async prefetch thread started`, and
->   subsequent forward passes log `expert_stream: async prefetch issued N
->   page hints across M layers`.
-> - `--expert-cache-size` is accepted by both `llama-cli` and `llama-server`.
+>   the first 4 forward passes (graph-node based, no scheduler callback)`,
+>   and per-pass logs show the countdown ticking 4 → 3 → 2 → 1 → 0.
+> - `--expert-prefetch` triggers `expert prefetch enabled — background worker
+>   will prefetch predicted next-token expert pages` and `async prefetch
+>   thread started`.
+> - A public-API decode harness (warmup pass + 12 argmax-feedback decode
+>   steps) completes with rc=0 on `qwen4exp-moe` in **seven representative**
+>   flag combinations spanning fixation {0, 2, 4, 8}, keep-recent {0, 2, 3}
+>   and prefetch {0, 1}, including all three features combined.
+> - **Numerical equivalence:** for `qwen4exp`, `qwen2moe`, `qwen35moe` and
+>   `deepseek4` test models, the final logits checksum over the same
+>   12-step decode is **bit-identical** with `--expert-streaming` on and
+>   off — the load-time path change does not alter any computation.
+> - The `LLAMA_ARG_EXPERT_STREAMING` environment variable path was
+>   exercised via `llama-completion` (the CLI family shares
+>   `common/arg.cpp` with `llama-cli` / `llama-server`).
+> - The classification unit suite (`is_routed_expert_tensor`, 30 cases:
+>   routed weights, shared experts/router, NVFP4 scales & biases, qwen4exp
+>   hyper-connection/PLE tensors, DeepSeek tid2eid) passes.
 
 ## Usage
 
@@ -385,9 +432,10 @@ tokens/s measured at decode token 400.
 | Model | Quant | Size (GB) | normal | expert-streaming | expert-prefetch | keep-recent 12 | fixation N=2 | fixation N=4 |
 |---|---|---|---|---|---|---|---|---|
 | Qwen3.5-35B-A3B   | Q4_K_M | 19.7 | ❌ fails to launch | 7.01 | — | 5.89 | **7.28** | 5.99 ⚠️ |
-| Qwen3.5-122B-A10B | Q2_K   | 42.6 | ❌ fails to launch | 2.00 | — | 1.00 | 0.35 ⚠️ | 0.53 ⚠️ |
-| MiniMax-2.7       | IQ1_M  | 60.7 | ❌ fails to launch | 0.75 | — | 0.44 | 0.53 ⚠️ | 0.40 ⚠️ |
+| Qwen3.5-122B-A10B | Q2_K   | 42.6 | ❌ fails to launch | **2.00** | — | 1.00 | 0.35 ⚠️ | 0.53 ⚠️ |
+| MiniMax-2.7       | IQ1_M  | 60.7 | ❌ fails to launch | **0.75** | — | 0.44 | 0.53 ⚠️ | 0.40 ⚠️ |
 | DeepSeek-V4-Flash-0731 | IQ1_M | 80.9 GB | ❌ fails to launch | 0.39 | **0.55** | 0.55 | -¹ | -¹ |
+| Qwen3.8-Flash-Next | IQ1_M | 69.4 GB | ❌ fails to launch | **0.63** | -¹ | -¹ | -¹ | -¹ |
 
 ⚠️ = a numeric throughput value was measured, but generation quality was
 visually confirmed to have collapsed (repetitive/incoherent output) under
@@ -452,7 +500,7 @@ doesn't apply to them the way it does on other architectures.
 A full write-up — motivation, design, implementation details (including
 thread-safety and warmup handling for the fixation graph node), and the
 complete experimental methodology — is included in this repository as
-[`Swap-MoE_report.pdf`](docs/Swap-MoE_report.pdf).
+[`Swap-MoE_Technical_Report.pdf`](docs/Swap-MoE_Technical_Report.pdf).
 
 ## Contributing
 
